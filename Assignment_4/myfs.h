@@ -11,7 +11,7 @@
 #define MEGA (1024*1024)
 #define INODE 1024
 #define BLOCK_SZ 256
-#define MAX_OPEN_FILES 100
+#define MAX_OPEN_FILES 1000
 
 typedef struct {
   short file_type;
@@ -34,7 +34,7 @@ typedef struct{
 } block;
 
 void * myfs,* myblocks;
-int * iptr, cwd, ofile_index;
+int * iptr, cwd, open_files;
 char *cptr, *inode_bmap, *block_bmap;
 inode * myinode;
 file *myfiles[MAX_OPEN_FILES];
@@ -62,11 +62,21 @@ void update_super(){
       iptr[4]++;
 }
 
-file* create_file_entry(int inode_no, int offset){
+int create_file_entry(int inode_no, int offset){
+  int i;
+  if(open_files>=MAX_OPEN_FILES)
+    return -1;
   file *f = (file*)malloc(sizeof(file));
   f->inode_no = inode_no;
   f->offset = offset;
-  return f;
+  for(i=0;i<MAX_OPEN_FILES;i++){
+    if(myfiles[i]==NULL){
+      myfiles[i]=f;
+      open_files++;
+      return i;
+    }
+  }
+  return -1;
 }
 
 int get_freeInode(){
@@ -86,7 +96,6 @@ int get_freeDB(){
   for (i = 0; i < iptr[3]; i++) {
     if(block_bmap[i]==0){
       block_bmap[i]=1;
-      //iptr[4]++;
       return i;
     }
   }
@@ -148,7 +157,7 @@ block newDB(int inode_no){
       *((int*)(myblocks + z*BLOCK_SZ + ((x-sub_blocks-8)%sub_blocks)*sizeof(int) )) = db_no;
     }
     z = *((int*)(myblocks + myinode[inode_no].block_ptr[9]*BLOCK_SZ + ((x-sub_blocks-8)/sub_blocks)*sizeof(int)));
-    db.no = *((int*)(myblocks + z*BLOCK_SZ));
+    db.no = *((int*)(myblocks + z*BLOCK_SZ + ((x-sub_blocks-8)%sub_blocks)*sizeof(int) ));
   //  printf("DB SENT %d\n",db.no);
   }
   else{
@@ -240,10 +249,10 @@ int create_myfs (int size){
   iptr[2] = 0;               // actual no of inodes used
   //printf("%d\n",( MEGA*size - ( 5*sizeof(int) + INODE*( sizeof(char)+sizeof(inode) ) ) ) / ( sizeof(char)+BLOCK_SZ ) );
   // calculating total no of data-blocks
-  iptr[3] = ( MEGA*size - ( 5*sizeof(int) + INODE*( sizeof(char)+sizeof(inode) ) ) ) / ( sizeof(char)+BLOCK_SZ );
+  iptr[3] = ( MEGA*size - ( 6*sizeof(int) + INODE*( sizeof(char)+sizeof(inode) ) ) ) / ( sizeof(char)+BLOCK_SZ );
   iptr[4] = 0;               // no of blocks used
   //printf("Hilo\n");
-  cptr = (char*)(iptr+5);
+  cptr = (char*)(iptr+6);
   inode_bmap = cptr;
   block_bmap = cptr+INODE;
   //printf("%d\n",(INODE+iptr[3]));
@@ -257,10 +266,10 @@ int create_myfs (int size){
   // create home directory
   cwd = get_freeInode();        // current working directory set to home
   newInode(cwd,1,0);
-  /*
-  myfiles[0] = create_file_entry(0,0);
-  ofile_index = 1;            // stores the 1 + index of the last entry in file table
-  */
+  iptr[5] = cwd;
+  open_files = 0;
+  for(i=0;i<MAX_OPEN_FILES;i++)
+    myfiles[i]=NULL;
   return 0;
 }
 
@@ -460,7 +469,6 @@ int copy_myfs2pc(char *source, char *dest){
   inode_no = getFileInode(source,0);
   if(inode_no==-1)
     return -1;
-  //printf("Humpty Dumpty\n");
   x = myinode[inode_no].file_size/BLOCK_SZ;
   y = myinode[inode_no].file_size%BLOCK_SZ;
   sub_blocks = (BLOCK_SZ)/sizeof(int);
@@ -584,6 +592,155 @@ int rmdir_myfs(char *dirname){
     //
   }
   rm_myfs(dirname);
+  return 0;
+}
+
+int open_myfs(char *filename, char mode){
+  int inode_no,newfile;
+  inode_no = getFileInode(filename,0);
+  if(inode_no == -1){
+    if(mode=='r')
+      return -1;
+    if(mode=='w'){
+      newfile = get_freeInode();
+      newInode(newfile,0,0);
+      add_file2dir(cwd,filename,newfile);
+    }
+  }
+  else{
+    if(mode=='r')
+      newfile = inode_no;
+    if(mode=='w'){
+      rm_myfs(filename);
+      newfile = get_freeInode();
+      newInode(newfile,0,0);
+      add_file2dir(cwd,filename,newfile);
+    }
+  }
+  return create_file_entry(newfile,0);
+}
+
+int close_myfs(int fd){
+  if(fd<0 || fd>=MAX_OPEN_FILES || myfiles[fd]==NULL)
+    return -1;
+  myfiles[fd] = NULL;
+  open_files--;
+  return 0;
+}
+
+int read_myfs(int fd, int nbytes, char *buff){
+  int x,y,z,sub_blocks,inode_no,db_no,wrbyte;
+  if(fd<0 || fd>=MAX_OPEN_FILES || myfiles[fd]==NULL)
+    return -1;
+  inode_no = myfiles[fd]->inode_no;
+  if(nbytes == 0 || myfiles[fd]->offset == myinode[inode_no].file_size)
+    return 0;
+
+  sub_blocks = BLOCK_SZ/sizeof(int);
+  x = myfiles[fd]->offset/BLOCK_SZ;
+  y = myfiles[fd]->offset%BLOCK_SZ;
+  z = myinode[inode_no].file_size - myfiles[fd]->offset;
+
+  wrbyte = (nbytes<z)? nbytes : z;
+  wrbyte = (wrbyte<(BLOCK_SZ-y))? wrbyte : (BLOCK_SZ-y);
+
+  if(x<8)
+    db_no = myinode[inode_no].block_ptr[x];
+  else if(x<(sub_blocks+8))
+    db_no = *((int*)(myblocks + myinode[inode_no].block_ptr[8]*BLOCK_SZ + (x-8)*sizeof(int)));
+  else if(x<(sub_blocks*sub_blocks + sub_blocks + 8)){
+    z = *((int*)(myblocks + myinode[inode_no].block_ptr[9]*BLOCK_SZ + ((x-sub_blocks-8)/sub_blocks)*sizeof(int)));
+    db_no = *((int*)(myblocks + z*BLOCK_SZ + ((x-sub_blocks-8)%sub_blocks)*sizeof(int) ));
+  }
+  else{
+    //
+  }
+  memcpy(buff,(myblocks + db_no*BLOCK_SZ + y),wrbyte);
+  myfiles[fd]->offset += wrbyte;
+  return (wrbyte + read_myfs(fd,(nbytes-wrbyte),buff+wrbyte));
+}
+
+int write_myfs(int fd, int nbytes, char *buff){
+  int inode_no, initial_offset;
+  block db;
+
+  if(fd<0 || fd>=MAX_OPEN_FILES || myfiles[fd]==NULL)
+    return -1;
+
+  inode_no = myfiles[fd]->inode_no;
+  initial_offset = myfiles[fd]->offset;
+
+  while(nbytes>0){
+    db = newDB(inode_no);
+    //printf("nbytes %d\t %d\n",nbytes,db.nbytes);
+    if(db.empty==NULL)
+      return (myfiles[fd]->offset - initial_offset);
+    if(nbytes<=db.nbytes){
+      memcpy(db.empty,buff,nbytes);
+      myinode[inode_no].file_size += nbytes;
+      myfiles[fd]->offset += nbytes;
+      nbytes = 0;
+    }
+    else{
+      //printf("Check 1\n");
+      memcpy(db.empty,buff,db.nbytes);
+      nbytes -= db.nbytes;
+      buff += db.nbytes;
+      myinode[inode_no].file_size += db.nbytes;
+      myfiles[fd]->offset += db.nbytes;
+    }
+  }
+  return (myfiles[fd]->offset - initial_offset);
+}
+
+int eof_myfs(int fd){
+  if(fd<0 || fd>=MAX_OPEN_FILES || myfiles[fd]==NULL)
+    return -1;
+
+  return (myfiles[fd]->offset == myinode[myfiles[fd]->inode_no].file_size)? 1:0;
+}
+
+int dump_myfs(char *dumpfile){
+  int fd;
+  fd = open(dumpfile,O_WRONLY|O_CREAT,0777);
+  if(fd==-1)
+    return -1;
+  if(write(fd,myfs,iptr[0]*MEGA) == -1)
+    return -1;
+  return close(fd);
+}
+
+int restore_myfs(char *dumpfile){
+  struct stat ast;
+  int fd,fsize,i;
+  fd = open(dumpfile,O_RDONLY);
+  if(fd==-1)
+    return -1;
+  fstat(fd,&ast);
+  fsize = ast.st_size;
+  myfs = malloc(fsize);
+  if(myfs==NULL)
+    return -1;
+  read(fd,myfs,fsize);
+  iptr = (int *)myfs;
+  cptr = (char*)(iptr+6);
+  inode_bmap = cptr;
+  block_bmap = cptr+INODE;
+  myinode = (inode*)(cptr+iptr[1]+iptr[3]);   // myinode points to start of inode list
+  myblocks = (void*)(myinode+INODE);
+  cwd = iptr[5];
+  open_files = 0;
+  for(i=0;i<MAX_OPEN_FILES;i++)
+    myfiles[i]=NULL;
+  return 0;
+}
+
+int chmod_myfs(char *name, int mode){
+  int inode_no;
+  inode_no = getFileInode(name,0);
+  if(inode_no==-1)
+    return -1;
+  myinode[inode_no].access_permission = (short)mode;
   return 0;
 }
 
