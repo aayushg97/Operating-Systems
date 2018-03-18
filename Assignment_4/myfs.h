@@ -6,7 +6,9 @@
 #include <string.h>
 #include <sys/types.h>
 #include <sys/stat.h>
+#include <sys/shm.h>
 #include <fcntl.h>
+#include <semaphore.h>
 
 #define MEGA (1024*1024)
 #define INODE 1024
@@ -14,32 +16,42 @@
 #define MAX_OPEN_FILES 1000
 
 typedef struct {
-  short file_type;
+  short file_type;              // 0-file or 1-directory
   short access_permission;
   int file_size;
   time_t last_modified;
   time_t last_accessed;
-  int block_ptr[10];
+  int block_ptr[10];            // block_no of data-blocks for inode
 } inode;
 
+// open file data structure
 typedef struct{
   int inode_no;
   int offset;
 } file;
 
+// data-block
 typedef struct{
-  int no;
-  int nbytes;
-  void *empty;
+  int no;       // data-block number
+  int nbytes;   // remaining bytes in block
+  void *empty;  // pointer to the first empty byte
 } block;
 
-void * myfs,* myblocks;
-int * iptr, cwd, open_files;
-char *cptr, *inode_bmap, *block_bmap;
-inode * myinode;
-file *myfiles[MAX_OPEN_FILES];
-int init[10] = {-1,-1,-1,-1,-1,-1,-1,-1,-1,-1};
+// Global variables
+void * myfs;          // pointer to file system
+void * myblocks;      // pointer to first data block
+sem_t * sem,*sem2;    // semaphores
+int * iptr;           // integer pointer to super-block
+int cwd;              // inode of current-working-directory
+int open_files;       // number of open files
+char *inode_bmap, *block_bmap;  // bitmap of inodes and data-blocks
+inode * myinode;      // pointer to first inode
+file **myfiles;       // global file table
 
+/*
+ * Converts 9 bit char access permission to short type to reduce memory
+ * usage and returns it
+*/
 short bin2short(char *bin){
   short access=0;
   int i;
@@ -48,6 +60,7 @@ short bin2short(char *bin){
   return access;
 }
 
+// updates number of data blocks and inodes used
 void update_super(){
   int i;
   iptr[2]=0;
@@ -62,6 +75,7 @@ void update_super(){
       iptr[4]++;
 }
 
+// adds open file entry to global table
 int create_file_entry(int inode_no, int offset){
   int i;
   if(open_files>=MAX_OPEN_FILES)
@@ -80,49 +94,54 @@ int create_file_entry(int inode_no, int offset){
 }
 
 int get_freeInode(){
-  int i;
+  int i,retval=-1;
+  sem_wait(sem);
   for (i = 0; i < iptr[1]; i++) {
     if(inode_bmap[i]==0){
       inode_bmap[i]=1;
-      iptr[2]++;
-      return i;
+      retval = i;
+      break;
     }
   }
-  return -1;
+  sem_post(sem);
+  return retval;
 }
 
 int get_freeDB(){
-  int i;
+  int i,retval=-1;
+  sem_wait(sem);
   for (i = 0; i < iptr[3]; i++) {
     if(block_bmap[i]==0){
       block_bmap[i]=1;
-      return i;
+      retval = i;
+      break;
     }
   }
-  return -1;
+  sem_post(sem);
+  return retval;
 }
 
 // initialise newly created file or folder inode
 void newInode(int inode_no,short file_type,short file_size){
+  int init[10] = {-1,-1,-1,-1,-1,-1,-1,-1,-1,-1};   // to initialise data-blocks for inode
   myinode[inode_no].file_type = file_type;
   myinode[inode_no].file_size = file_size;
   time(&myinode[inode_no].last_accessed);
   time(&myinode[inode_no].last_modified);
-  myinode[inode_no].access_permission = bin2short("111000000");   // default access_permission
+  myinode[inode_no].access_permission = bin2short("111000000");   // default owner access_permission
   memcpy(myinode[inode_no].block_ptr,init,sizeof(init));
 }
 
+// returns next data block for given inode
 block newDB(int inode_no){
   block db;
   int fsize,x,y,z,db_no,sub_blocks;
   sub_blocks = BLOCK_SZ/sizeof(int);
   fsize = myinode[inode_no].file_size;
-  //printf("fsz %d\n",fsize );
   x = fsize/BLOCK_SZ;
   y = fsize%BLOCK_SZ;
   if(x<8){
     if(y==0){
-      //printf("New block! %d\n",myinode[inode_no].block_ptr[x]);
       db_no = get_freeDB();
       myinode[inode_no].block_ptr[x] = db_no;
     }
@@ -142,23 +161,19 @@ block newDB(int inode_no){
   else if(x<(sub_blocks*sub_blocks + sub_blocks + 8)){
     if(x==(sub_blocks+8) && y==0){
       db_no = get_freeDB();
-    //  printf("db1 %d\n",db_no );
       myinode[inode_no].block_ptr[9] = db_no;
     }
     if((x-sub_blocks-8)%sub_blocks==0 && y==0){
         db_no = get_freeDB();
-    //    printf("db2 %d\n",db_no );
         *((int*)(myblocks + myinode[inode_no].block_ptr[9]*BLOCK_SZ + ((x-sub_blocks-8)/sub_blocks)*sizeof(int))) = db_no;
     }
     if(y==0){
       db_no = get_freeDB();
-    //  printf("db3 %d\n",db_no );
       z = *((int*)(myblocks + myinode[inode_no].block_ptr[9]*BLOCK_SZ + ((x-sub_blocks-8)/sub_blocks)*sizeof(int)));
       *((int*)(myblocks + z*BLOCK_SZ + ((x-sub_blocks-8)%sub_blocks)*sizeof(int) )) = db_no;
     }
     z = *((int*)(myblocks + myinode[inode_no].block_ptr[9]*BLOCK_SZ + ((x-sub_blocks-8)/sub_blocks)*sizeof(int)));
     db.no = *((int*)(myblocks + z*BLOCK_SZ + ((x-sub_blocks-8)%sub_blocks)*sizeof(int) ));
-  //  printf("DB SENT %d\n",db.no);
   }
   else{
     printf("Too big file! Exhausted allocatable file blocks.\n");
@@ -172,19 +187,24 @@ block newDB(int inode_no){
   return db;
 }
 
+// insert file entry to the directory
 void add_file2dir(int folder_no, char *fname,int file_no){
+  sem_wait(sem2);
   block db;
   db = newDB(folder_no);
   if(db.nbytes < 32){
     printf("Unexpected error!\n");
   }
-  strcpy((char*)db.empty,fname);
+  strcpy((char*)db.empty,fname);        // adding entry
   *((int*)(db.empty+28)) = file_no;
-  myinode[folder_no].file_size += 32;
+  myinode[folder_no].file_size += 32;   // incrementing file size
+  sem_post(sem2);
   // last_accessed folder
 }
 
+// get inode_no of file in current directory and optionally remove its entry
 int getFileInode(char* fname,int rem_file){
+  sem_wait(sem2);
   int x,y,i,j,retval=-1;
   x = (myinode[cwd].file_size)/BLOCK_SZ;
   y = (myinode[cwd].file_size)%BLOCK_SZ;
@@ -212,8 +232,10 @@ int getFileInode(char* fname,int rem_file){
       }
       if(retval!=-1) break;
     }
-    if(retval!=-1)
+    if(retval!=-1){
+      sem_post(sem2);
       return retval;
+    }
     if(x==8 && y>0){
       //
     }
@@ -234,53 +256,77 @@ int getFileInode(char* fname,int rem_file){
       }
     }
   }
+  sem_post(sem2);
   return retval;
 }
 
+// creating file system
 int create_myfs (int size){
-  int i;
-  myfs = malloc(size*MEGA);
-  if(myfs == NULL)
-    return -1;
+  int i,shmid1,shmid2;
+  key_t key1,key2;
+  char * cptr;
 
+  sem_unlink ("mutex");
+  sem_unlink ("mutex2");
+  /* initialize semaphores for shared processes */
+    sem = sem_open ("mutex", O_CREAT | O_EXCL, 0644, 1);
+    sem2 = sem_open ("mutex2", O_CREAT | O_EXCL, 0644, 1);
+
+  // creating shared memory segment for myfs
+  key1 = 1234;
+  shmid1 = shmget(key1,size*MEGA,IPC_CREAT|0666);
+  if(shmid1<0){
+    perror("shmget1\n");
+    return -1;
+  }
+  myfs = shmat(shmid1,NULL,0);
   iptr = (int *)myfs;
   iptr[0] = size;            // total file sys size
   iptr[1] = INODE;           // max no of inodes supported
   iptr[2] = 0;               // actual no of inodes used
-  //printf("%d\n",( MEGA*size - ( 5*sizeof(int) + INODE*( sizeof(char)+sizeof(inode) ) ) ) / ( sizeof(char)+BLOCK_SZ ) );
+
   // calculating total no of data-blocks
   iptr[3] = ( MEGA*size - ( 6*sizeof(int) + INODE*( sizeof(char)+sizeof(inode) ) ) ) / ( sizeof(char)+BLOCK_SZ );
   iptr[4] = 0;               // no of blocks used
-  //printf("Hilo\n");
   cptr = (char*)(iptr+6);
   inode_bmap = cptr;
   block_bmap = cptr+INODE;
-  //printf("%d\n",(INODE+iptr[3]));
+
   // initialise bitmap for both free inodes and diskblocks
   for ( i = 0; i < (INODE+iptr[3]); i++)
     cptr[i]=0;
-//  printf("Hilo3\n");
-  myinode = (inode*)(cptr+i);   // myinode points to start of inode list
-  myblocks = (void*)(myinode+INODE);
-  // printf("Hilo4\n");
+  myinode = (inode*)(cptr+i);       // myinode points to start of inode list
+  myblocks = (void*)(myinode+INODE);// myblocks points to start of data-blocks
+
   // create home directory
-  cwd = get_freeInode();        // current working directory set to home
+  cwd = get_freeInode();        // current working directory set to root
   newInode(cwd,1,0);
-  iptr[5] = cwd;
-  open_files = 0;
+  iptr[5] = cwd;                // store root directory in super-block
+  open_files = 0;               // initialise number of open files
+
+  // shared segment for global file table
+  key2 = 8080;
+  shmid2 = shmget(key2,sizeof(file*)*MAX_OPEN_FILES,0666|IPC_CREAT);
+  if(shmid2<0){
+    perror("shmget2\n");
+    return -1;
+  }
+  myfiles = (file**)shmat(shmid2,NULL,0);
+
+  // initialise global open file table
   for(i=0;i<MAX_OPEN_FILES;i++)
     myfiles[i]=NULL;
   return 0;
 }
 
+// copy files from pc to mrfs
 int copy_pc2myfs(char *source, char *dest){
   struct stat ast;
   int fsize, fd, inode_no;
   block db;
-  fd = open(source,O_RDONLY);
+  fd = open(source,O_RDONLY);     // open pc file in read mode
   fstat(fd,&ast);
   fsize = ast.st_size;
-  //printf("ffff %d\n",fsize);
   if(iptr[2] == iptr[1]){
     printf("All inodes used: %d\n",iptr[2]);
     return -1;
@@ -289,14 +335,15 @@ int copy_pc2myfs(char *source, char *dest){
     printf("Not enough space! Required = %d B | Available = %d B\n",fsize,(iptr[3]-iptr[4])*BLOCK_SZ);
     return -1;
   }
-
   // check for extra large files here
 
-  inode_no = get_freeInode();
+  inode_no = get_freeInode();       // create inode for mrfs file
   newInode(inode_no,0,0);
 
+  // copy file blockwise
   while(fsize>0){
     db = newDB(inode_no);
+    // check semaphore
     if(db.empty==NULL)
       return -1;
     if(fsize<=db.nbytes){
@@ -310,17 +357,17 @@ int copy_pc2myfs(char *source, char *dest){
       myinode[inode_no].file_size += db.nbytes;
     }
   }
-  add_file2dir(cwd,dest,inode_no);
+  add_file2dir(cwd,dest,inode_no);        // add file to current directory
   return 0;
 }
 
+// display contents of current directory
 int ls_myfs(){
   char name[28];
   int inode_no,x,y,i,j;
   printf("| name\t| size(B)\t| type\t| last_modified\t| last_accessed\t| access_permission |\n");
   printf("----------------------------------------------------------------------------------\n");
 
-  //no_files = (myinode[cwd].file_size)/32;
   x = (myinode[cwd].file_size)/BLOCK_SZ;
   y = (myinode[cwd].file_size)%BLOCK_SZ;
 
@@ -349,14 +396,13 @@ int ls_myfs(){
   }
 }
 
+// remove file from mrfs
 int rm_myfs(char *filename){
-  update_super();
-  printf("deleting %s\n",filename);
-  //printf("blocs = %d\n",iptr[4]);
   int inode_no,x,y,z,i,j,sub_blocks;
-  inode_no = getFileInode(filename,1);
+  inode_no = getFileInode(filename,1);      // remove file from directory-list
   if(inode_no==-1)
     return -1;
+  sem_wait(sem);
   x = myinode[inode_no].file_size/BLOCK_SZ;
   y = myinode[inode_no].file_size%BLOCK_SZ;
   sub_blocks = BLOCK_SZ/sizeof(int);
@@ -370,8 +416,6 @@ int rm_myfs(char *filename){
     }
     else if(y>0)
       block_bmap[myinode[inode_no].block_ptr[x]] = 0;
-    update_super();
-    printf("blocs = %d\n",iptr[4]);
   }
   else if(x<=(sub_blocks+8)){
     iptr[4]++;
@@ -388,31 +432,20 @@ int rm_myfs(char *filename){
     }
     else if(y>0)
       block_bmap[*((int*)(myblocks + myinode[inode_no].block_ptr[8]*BLOCK_SZ + (x-8)*sizeof(int)))] = 0;
-      update_super();
-      printf("blocs = %d\n",iptr[4]);
   }
   else if(x<=(sub_blocks*sub_blocks + sub_blocks + 8)){
     iptr[4] += 3;
     for(i=0;i<=9;i++)
       block_bmap[myinode[inode_no].block_ptr[i]] = 0;
-    update_super();
-//    printf("a blocs = %d\n",iptr[4]);
 
     for(i=0;i<(sub_blocks);i++)
       block_bmap[*((int*)(myblocks + myinode[inode_no].block_ptr[8]*BLOCK_SZ + i*sizeof(int)))] = 0;
-      update_super();
-    //  printf("b blocs = %d\n",iptr[4]);
 
     for(i=0;i<(x-sub_blocks-8)/sub_blocks;i++){
       z = *((int*)(myblocks + myinode[inode_no].block_ptr[9]*BLOCK_SZ + i*sizeof(int)));
-    //  printf("Z=%d\n",z);
       block_bmap[z] = 0;
       for(j=0;j<sub_blocks;j++){
-      //  printf("bval %c \n",block_bmap[*((int*)(myblocks + z*BLOCK_SZ + j*sizeof(int)))]+'0' );
-      //  printf("Block No %d\n",*((int*)(myblocks + z*BLOCK_SZ + j*sizeof(int))) );
         block_bmap[*((int*)(myblocks + z*BLOCK_SZ + j*sizeof(int)))] = 0;
-        update_super();
-      //  printf("c blocs = %d\n",iptr[4]);
       }
     }
     if((x-sub_blocks-8)%sub_blocks >0){
@@ -422,30 +455,23 @@ int rm_myfs(char *filename){
         block_bmap[*((int*)(myblocks + z*BLOCK_SZ + j*sizeof(int)))] = 0;
         if(y>0)
           block_bmap[*((int*)(myblocks + z*BLOCK_SZ + j*sizeof(int)))] = 0;
-          update_super();
-        //  printf("d blocs = %d\n",iptr[4]);
-
     }
     else if(y>0){
       z = *((int*)(myblocks + myinode[inode_no].block_ptr[9]*BLOCK_SZ + i*sizeof(int)));
       block_bmap[z] = 0;
       block_bmap[*((int*)(myblocks + z*BLOCK_SZ ))] = 0;
-      update_super();
-    //  printf("e blocs = %d\n",iptr[4]);
-
     }
   }
-  update_super();
-  //printf("blocs = %d\n",iptr[4]);
   inode_bmap[inode_no] = 0;
+  sem_post(sem);
   return 0;
 }
 
+// print status of file system
 int status_myfs(){
   int i;
   update_super();
   double used=0,freespace;
-  printf("Block used: %d / %d\n",iptr[4],iptr[3]);
   for(i=0;i<iptr[1];i++){
     if(inode_bmap[i]==1){
       used += myinode[i].file_size;
@@ -457,9 +483,10 @@ int status_myfs(){
   printf("Space Occupied          :\t%lf MB\n",(iptr[0]-freespace));
   printf("Number of files/folders :\t%d\n",iptr[2]);
   printf("Space Available         :\t%lf MB\n",freespace);
-
+  printf("Block used              :\t%d / %d\n",iptr[4],iptr[3]);
 }
 
+// copy file from mrfs to pc
 int copy_myfs2pc(char *source, char *dest){
   int fd,x,y,z,z_,inode_no,sub_blocks,i,j;
   if(!strcmp(dest,"stdout"))
@@ -530,28 +557,30 @@ int copy_myfs2pc(char *source, char *dest){
       z = *((int*)(myblocks + myinode[inode_no].block_ptr[9]*BLOCK_SZ + i*sizeof(int)));
       z_ = *((int*)(myblocks + z*BLOCK_SZ ));
       write(fd,(myblocks+z_*BLOCK_SZ),y);
-
     }
   }
   if(strcmp(dest,"stdout"))
     close(fd);
 }
 
+// display file on terminal
 int showfile_myfs(char *filename){
   return copy_myfs2pc(filename,"stdout");
 }
 
+// make new directory
 int mkdir_myfs(char *dirname){
   int inode_no;
   inode_no = get_freeInode();
   if(inode_no==-1)
     return -1;
   newInode(inode_no,1,0);
-  add_file2dir(cwd,dirname,inode_no);
-  add_file2dir(inode_no,"..",cwd);
+  add_file2dir(cwd,dirname,inode_no);     // add created directory to current directory's list
+  add_file2dir(inode_no,"..",cwd);        // add current directory as parent in created directory's list
   return 0;
 }
 
+// change directory
 int chdir_myfs(char *dirname){
   int inode_no;
   inode_no = getFileInode(dirname,0);
@@ -563,6 +592,7 @@ int chdir_myfs(char *dirname){
   return 0;
 }
 
+// remove directory from current directory
 int rmdir_myfs(char *dirname){
   int folder_no,file_no,temp_cwd,x,y,i,j,sz;
   char fname[28];
@@ -580,9 +610,9 @@ int rmdir_myfs(char *dirname){
         file_no = *((int*)(myblocks + myinode[folder_no].block_ptr[i]*BLOCK_SZ + j + 28));
         temp_cwd = cwd;
         cwd = folder_no;
-        if(myinode[file_no].file_type == 1 && strcmp("..",fname)!=0)
+        if(myinode[file_no].file_type == 1 && strcmp("..",fname)!=0)      // if folder then recursively delete
           rmdir_myfs(fname);
-        if(myinode[file_no].file_type == 0)
+        if(myinode[file_no].file_type == 0)                       // if file then remove
           rm_myfs(fname);
         cwd = temp_cwd;
       }
@@ -591,14 +621,15 @@ int rmdir_myfs(char *dirname){
   else if(x==8){
     //
   }
-  rm_myfs(dirname);
+  rm_myfs(dirname);           // remove directory from current directory
   return 0;
 }
 
+// open file
 int open_myfs(char *filename, char mode){
-  int inode_no,newfile;
+  int inode_no,newfile,retval;
   inode_no = getFileInode(filename,0);
-  if(inode_no == -1){
+  if(inode_no == -1){         // file not already present
     if(mode=='r')
       return -1;
     if(mode=='w'){
@@ -607,7 +638,7 @@ int open_myfs(char *filename, char mode){
       add_file2dir(cwd,filename,newfile);
     }
   }
-  else{
+  else{                       // file present in directory
     if(mode=='r')
       newfile = inode_no;
     if(mode=='w'){
@@ -617,17 +648,22 @@ int open_myfs(char *filename, char mode){
       add_file2dir(cwd,filename,newfile);
     }
   }
-  return create_file_entry(newfile,0);
+  sem_wait(sem);
+  retval = create_file_entry(newfile,0);
+  sem_post(sem);
+  return retval;
 }
 
+// close file
 int close_myfs(int fd){
   if(fd<0 || fd>=MAX_OPEN_FILES || myfiles[fd]==NULL)
     return -1;
-  myfiles[fd] = NULL;
+  myfiles[fd] = NULL; //semaphore
   open_files--;
   return 0;
 }
 
+// read from open file
 int read_myfs(int fd, int nbytes, char *buff){
   int x,y,z,sub_blocks,inode_no,db_no,wrbyte;
   if(fd<0 || fd>=MAX_OPEN_FILES || myfiles[fd]==NULL)
@@ -660,6 +696,7 @@ int read_myfs(int fd, int nbytes, char *buff){
   return (wrbyte + read_myfs(fd,(nbytes-wrbyte),buff+wrbyte));
 }
 
+// write to open file
 int write_myfs(int fd, int nbytes, char *buff){
   int inode_no, initial_offset;
   block db;
@@ -672,7 +709,6 @@ int write_myfs(int fd, int nbytes, char *buff){
 
   while(nbytes>0){
     db = newDB(inode_no);
-    //printf("nbytes %d\t %d\n",nbytes,db.nbytes);
     if(db.empty==NULL)
       return (myfiles[fd]->offset - initial_offset);
     if(nbytes<=db.nbytes){
@@ -682,7 +718,6 @@ int write_myfs(int fd, int nbytes, char *buff){
       nbytes = 0;
     }
     else{
-      //printf("Check 1\n");
       memcpy(db.empty,buff,db.nbytes);
       nbytes -= db.nbytes;
       buff += db.nbytes;
@@ -693,13 +728,14 @@ int write_myfs(int fd, int nbytes, char *buff){
   return (myfiles[fd]->offset - initial_offset);
 }
 
+// check end-of-file
 int eof_myfs(int fd){
   if(fd<0 || fd>=MAX_OPEN_FILES || myfiles[fd]==NULL)
     return -1;
-
   return (myfiles[fd]->offset == myinode[myfiles[fd]->inode_no].file_size)? 1:0;
 }
 
+// dump mrfs to disk
 int dump_myfs(char *dumpfile){
   int fd;
   fd = open(dumpfile,O_WRONLY|O_CREAT,0777);
@@ -710,17 +746,31 @@ int dump_myfs(char *dumpfile){
   return close(fd);
 }
 
+// restore mrfs from disk
 int restore_myfs(char *dumpfile){
   struct stat ast;
-  int fd,fsize,i;
+  int fd,fsize,i,shmid1,shmid2;
+  char *cptr;
+  key_t key1,key2;
+
+  sem_unlink ("mutex");
+  sem_unlink ("mutex2");
+  /* initialize semaphores for shared processes */
+    sem = sem_open ("mutex", O_CREAT | O_EXCL, 0644, 1);
+    sem2 = sem_open ("mutex2", O_CREAT | O_EXCL, 0644, 1);
   fd = open(dumpfile,O_RDONLY);
   if(fd==-1)
     return -1;
   fstat(fd,&ast);
   fsize = ast.st_size;
-  myfs = malloc(fsize);
-  if(myfs==NULL)
+
+  key1 = 1234;
+  shmid1 = shmget(key1,fsize,IPC_CREAT|0666);
+  if(shmid1<0){
+    perror("shmget1\n");
     return -1;
+  }
+  myfs = shmat(shmid1,NULL,0);
   read(fd,myfs,fsize);
   iptr = (int *)myfs;
   cptr = (char*)(iptr+6);
@@ -730,11 +780,21 @@ int restore_myfs(char *dumpfile){
   myblocks = (void*)(myinode+INODE);
   cwd = iptr[5];
   open_files = 0;
+
+  key2 = 8080;
+  shmid2 = shmget(key2,sizeof(file*)*MAX_OPEN_FILES,0666|IPC_CREAT);
+  if(shmid2<0){
+    perror("shmget2\n");
+    return -1;
+  }
+  myfiles = (file**)shmat(shmid2,NULL,0);
+
   for(i=0;i<MAX_OPEN_FILES;i++)
     myfiles[i]=NULL;
   return 0;
 }
 
+// change access mode of file
 int chmod_myfs(char *name, int mode){
   int inode_no;
   inode_no = getFileInode(name,0);
@@ -743,5 +803,4 @@ int chmod_myfs(char *name, int mode){
   myinode[inode_no].access_permission = (short)mode;
   return 0;
 }
-
 #endif

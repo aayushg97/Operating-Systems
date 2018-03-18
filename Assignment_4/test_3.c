@@ -14,8 +14,10 @@ int main(int argc, char const *argv[]) {
 
   printf("Reading integers from file mytest.txt ...\n");
   fd = open_myfs("mytest.txt",'r');
+  printf("Hey\n" );
   for(i=0;i<100;i++){
     read_myfs(fd,sizeof(no),&no);
+    printf("Hey%d", i);
     arr[i] = no;
     printf("%d\n",no);
   }
