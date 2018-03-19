@@ -12,7 +12,8 @@ int main(int argc, char const *argv[]) {
   fd = open_myfs("mytest.txt",'w');
   for(i=0;i<100;i++){
     no = rand();
-    write_myfs(fd,sizeof(no),&no);
+    if(write_myfs(fd,sizeof(no),&no)==-1)
+      printf("Failed to write\n");
   }
   close_myfs(fd);
   printf("Done.\n Displaying contents of directory:-\n\n ");
@@ -30,9 +31,11 @@ int main(int argc, char const *argv[]) {
   }
   while(!eof_myfs(fd)){
     read_myfs(fd,sizeof(no),&no);
-    for(i=1;i<=N;i++)
-      write_myfs(fds[i],sizeof(no),&no);
-  }
+    for(i=1;i<=N;i++){
+        if(write_myfs(fds[i],sizeof(no),&no)==-1)
+          printf("Failed to create copy\n");
+      }
+    }
   for(i=1;i<=N;i++)
     close_myfs(fds[i]);
   printf("Done.\n Displaying contents of directory:-\n\n ");
@@ -40,5 +43,8 @@ int main(int argc, char const *argv[]) {
   printf("\n Dumping MFRS to PC ...\n");
   dump_myfs("mydump-1.backup");
   printf("Done.\n");
+  if(clear_myfs())
+   printf("\nCleared file system\n");
+ 
   return 0;
 }

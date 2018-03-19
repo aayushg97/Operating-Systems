@@ -14,10 +14,10 @@ int main(int argc, char const *argv[]) {
   chdir_myfs("mydocs");
   mkdir_myfs("mytext");
   mkdir_myfs("mypapers");
-  printf("Directory mydocs contents:\n");
+  printf("\nDirectory mydocs contents:\n");
   ls_myfs();
   chdir_myfs("..");
-  printf("Directory myroot contents:\n");
+  printf("\nDirectory myroot contents:\n\n");
   ls_myfs();
   if(fork()==0){
     //p1
@@ -35,20 +35,26 @@ int main(int argc, char const *argv[]) {
   }else{
     //p2
     chdir_myfs("mycode");
-    printf("P2 || Enter file to be copied under /mycode: ");
+    printf("\nP2 says Enter file to be copied under /mycode:\n");
     scanf("%s",fname);
-    copy_pc2myfs(fname,fname);
+    if(copy_pc2myfs(fname,fname)==-1)
+      printf("Failed to copy.\n");
+    else
+      printf("Copied.\n");
   }
   sleep(1);
-  printf("Directory mycode contents:\n");
+  printf("\nDirectory mycode contents:\n");
   ls_myfs();
-  printf("Displaying contents of file %s: \n",fname);
+  printf("\nDisplaying contents of file %s: \n\n",fname);
   showfile_myfs(fname);
   chdir_myfs("..");
   chdir_myfs("mydocs");
   chdir_myfs("mytext");
-  printf("Directory mytext contents:\n");
+  printf("\nDirectory mytext contents:\n");
   ls_myfs();
+  printf("\nDisplaying contents of file alphabet.txt:\n");
   showfile_myfs("alphabet.txt");
+  if(clear_myfs())
+   printf("\nCleared file system\n");
   return 0;
 }

@@ -28,6 +28,7 @@ typedef struct {
 typedef struct{
   int inode_no;
   int offset;
+  char mode;
 } file;
 
 // data-block
@@ -47,7 +48,7 @@ int open_files;       // number of open files
 char *inode_bmap, *block_bmap;  // bitmap of inodes and data-blocks
 inode * myinode;      // pointer to first inode
 file **myfiles;       // global file table
-
+int shmid1,shmid2;    // shmids for myfs and file table
 /*
  * Converts 9 bit char access permission to short type to reduce memory
  * usage and returns it
@@ -76,13 +77,14 @@ void update_super(){
 }
 
 // adds open file entry to global table
-int create_file_entry(int inode_no, int offset){
+int create_file_entry(int inode_no, int offset, char mode){
   int i;
   if(open_files>=MAX_OPEN_FILES)
     return -1;
   file *f = (file*)malloc(sizeof(file));
   f->inode_no = inode_no;
   f->offset = offset;
+  f->mode = mode;
   for(i=0;i<MAX_OPEN_FILES;i++){
     if(myfiles[i]==NULL){
       myfiles[i]=f;
@@ -260,9 +262,22 @@ int getFileInode(char* fname,int rem_file){
   return retval;
 }
 
+// clearing file system
+int clear_myfs(){
+  shmdt (myfs);
+  shmctl (shmid1, IPC_RMID, 0);
+  shmdt (myfiles);
+  shmctl (shmid2, IPC_RMID, 0);
+  sem_unlink ("mutex");
+  sem_close(sem);
+  sem_unlink ("mutex2");
+  sem_close(sem2);
+  return 1;
+}
+
 // creating file system
 int create_myfs (int size){
-  int i,shmid1,shmid2;
+  int i;
   key_t key1,key2;
   char * cptr;
 
@@ -325,6 +340,9 @@ int copy_pc2myfs(char *source, char *dest){
   int fsize, fd, inode_no;
   block db;
   fd = open(source,O_RDONLY);     // open pc file in read mode
+  if(fd<0)
+    return -1;
+
   fstat(fd,&ast);
   fsize = ast.st_size;
   if(iptr[2] == iptr[1]){
@@ -649,7 +667,7 @@ int open_myfs(char *filename, char mode){
     }
   }
   sem_wait(sem);
-  retval = create_file_entry(newfile,0);
+  retval = create_file_entry(newfile,0,mode);
   sem_post(sem);
   return retval;
 }
@@ -666,7 +684,7 @@ int close_myfs(int fd){
 // read from open file
 int read_myfs(int fd, int nbytes, char *buff){
   int x,y,z,sub_blocks,inode_no,db_no,wrbyte;
-  if(fd<0 || fd>=MAX_OPEN_FILES || myfiles[fd]==NULL)
+  if(fd<0 || fd>=MAX_OPEN_FILES || myfiles[fd]==NULL || myfiles[fd]->mode!='r')
     return -1;
   inode_no = myfiles[fd]->inode_no;
   if(nbytes == 0 || myfiles[fd]->offset == myinode[inode_no].file_size)
@@ -701,7 +719,7 @@ int write_myfs(int fd, int nbytes, char *buff){
   int inode_no, initial_offset;
   block db;
 
-  if(fd<0 || fd>=MAX_OPEN_FILES || myfiles[fd]==NULL)
+  if(fd<0 || fd>=MAX_OPEN_FILES || myfiles[fd]==NULL || myfiles[fd]->mode!='w')
     return -1;
 
   inode_no = myfiles[fd]->inode_no;
