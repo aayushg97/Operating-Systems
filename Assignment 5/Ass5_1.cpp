@@ -248,7 +248,7 @@ void readFile(const char *filename, int no_page, int m, int mode, const char *ou
 
     fprintf(fp1, "Number of page faults = %d\n", page_faults);
     fprintf(fp1, "Number of page transfers = %d\n", page_transfers);
-    fprintf(fp1, "Cost of memory operations = %lld\n", cost);
+    fprintf(fp1, "Overall execution time in cycles = %lld\n", cost);
     fclose(fp);
     fclose(fp1);
 }
